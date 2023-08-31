@@ -1,47 +1,67 @@
 #syntax=docker/dockerfile:1.4
 
-# Versions
-FROM php:8.2-fpm-alpine AS php_upstream
-FROM mlocati/php-extension-installer:2 AS php_extension_installer_upstream
-FROM composer/composer:2-bin AS composer_upstream
-FROM caddy:2-alpine AS caddy_upstream
-
-
 # The different stages of this Dockerfile are meant to be built into separate images
 # https://docs.docker.com/develop/develop-images/multistage-build/#stop-at-a-specific-build-stage
 # https://docs.docker.com/compose/compose-file/#target
 
+# https://docs.docker.com/engine/reference/builder/#understand-how-arg-and-from-interact
+ARG PHP_VERSION=8.1
+ARG CADDY_VERSION=2.7
 
-# Base PHP image
-FROM php_upstream AS php_base
+# Prod image
+FROM php:${PHP_VERSION}-fpm-alpine AS app_php
+
+# Allow to use development versions of Symfony
+ARG STABILITY="stable"
+ENV STABILITY ${STABILITY}
+RUN apk add tzdata
+ENV TZ=Europe/Berlin
+RUN ln -snf /usr/share/zoneinfo/$TZ /etc/localtime && echo $TZ > /etc/timezone
+
+# Allow to select Symfony version
+ARG SYMFONY_VERSION="6.2.*"
+ENV SYMFONY_VERSION ${SYMFONY_VERSION}
+
+ENV APP_ENV=prod
 
 WORKDIR /srv/app
 
+# php extensions installer: https://github.com/mlocati/docker-php-extension-installer
+ADD https://github.com/mlocati/docker-php-extension-installer/releases/latest/download/install-php-extensions /usr/local/bin/
+RUN chmod +x /usr/local/bin/install-php-extensions
+
 # persistent / runtime deps
-# hadolint ignore=DL3018
 RUN apk add --no-cache \
 		acl \
 		fcgi \
 		file \
 		gettext \
 		git \
+    	ffmpeg \
 	;
-
-# php extensions installer: https://github.com/mlocati/docker-php-extension-installer
-COPY --from=php_extension_installer_upstream --link /usr/bin/install-php-extensions /usr/local/bin/
 
 RUN set -eux; \
     install-php-extensions \
-		apcu \
-		intl \
+    	intl \
+    	zip \
+    	apcu \
 		opcache \
-		zip \
+    	pdo-mysql \
     ;
 
 ###> recipes ###
+###> doctrine/doctrine-bundle ###
+RUN docker-php-ext-install mysqli pdo pdo_mysql && docker-php-ext-enable pdo_mysql
+RUN apk add --no-cache --virtual .pgsql-deps postgresql-dev; \
+	docker-php-ext-install -j$(nproc) pdo_pgsql; \
+	apk add --no-cache --virtual .pgsql-rundeps so:libpq.so.5; \
+	apk del .pgsql-deps
+###< doctrine/doctrine-bundle ###
 ###< recipes ###
 
+RUN mv "$PHP_INI_DIR/php.ini-production" "$PHP_INI_DIR/php.ini"
 COPY --link docker/php/conf.d/app.ini $PHP_INI_DIR/conf.d/
+COPY --link docker/php/conf.d/app.prod.ini $PHP_INI_DIR/conf.d/
 
 COPY --link docker/php/php-fpm.d/zz-docker.conf /usr/local/etc/php-fpm.d/zz-docker.conf
 RUN mkdir -p /var/run/php
@@ -61,62 +81,65 @@ CMD ["php-fpm"]
 ENV COMPOSER_ALLOW_SUPERUSER=1
 ENV PATH="${PATH}:/root/.composer/vendor/bin"
 
-COPY --from=composer_upstream --link /composer /usr/bin/composer
+COPY --from=composer:2 --link /usr/bin/composer /usr/bin/composer
 
+# prevent the reinstallation of vendors at every changes in the source code
+COPY composer.* symfony.* ./
+RUN set -eux; \
+    if [ -f composer.json ]; then \
+		composer install --prefer-dist --no-dev --no-autoloader --no-scripts --no-progress; \
+		composer clear-cache; \
+    fi
 
-# Dev PHP image
-FROM php_base AS php_dev
+# copy sources
+COPY --link  . .
+RUN rm -Rf docker/
+RUN set -eux; \
+	mkdir -p var/cache var/log; \
+    if [ -f composer.json ]; then \
+		composer dump-autoload --classmap-authoritative --no-dev; \
+		composer dump-env prod; \
+		composer run-script --no-dev post-install-cmd; \
+		chmod +x bin/console; sync; \
+    fi
+
+# Dev image
+FROM app_php AS app_php_dev
 
 ENV APP_ENV=dev XDEBUG_MODE=off
 VOLUME /srv/app/var/
 
-RUN mv "$PHP_INI_DIR/php.ini-development" "$PHP_INI_DIR/php.ini"
-
-RUN set -eux; \
-	install-php-extensions \
-    	xdebug \
-    ;
+RUN rm $PHP_INI_DIR/conf.d/app.prod.ini; \
+	mv "$PHP_INI_DIR/php.ini" "$PHP_INI_DIR/php.ini-production"; \
+	mv "$PHP_INI_DIR/php.ini-development" "$PHP_INI_DIR/php.ini"
 
 COPY --link docker/php/conf.d/app.dev.ini $PHP_INI_DIR/conf.d/
 
-# Prod PHP image
-FROM php_base AS php_prod
-
-ENV APP_ENV=prod
-
-RUN mv "$PHP_INI_DIR/php.ini-production" "$PHP_INI_DIR/php.ini"
-COPY --link docker/php/conf.d/app.prod.ini $PHP_INI_DIR/conf.d/
-
-# prevent the reinstallation of vendors at every changes in the source code
-COPY --link composer.* symfony.* ./
 RUN set -eux; \
-	composer install --no-cache --prefer-dist --no-dev --no-autoloader --no-scripts --no-progress
+	install-php-extensions xdebug
 
-# copy sources
-COPY --link . ./
-RUN rm -Rf docker/
+RUN docker-php-ext-install pdo pdo_mysql
 
-RUN set -eux; \
-	mkdir -p var/cache var/log; \
-	composer dump-autoload --classmap-authoritative --no-dev; \
-	composer dump-env prod; \
-	composer run-script --no-dev post-install-cmd; \
-	chmod +x bin/console; sync;
+RUN rm -f .env.local.php
 
+RUN apk add tzdata
+ENV TZ=Europe/Berlin
+RUN ln -snf /usr/share/zoneinfo/$TZ /etc/localtime && echo $TZ > /etc/timezone
 
-# Base Caddy image
-FROM caddy_upstream AS caddy_base
+# Build Caddy with the Mercure and Vulcain modules
+FROM caddy:${CADDY_VERSION}-builder-alpine AS app_caddy_builder
 
-ARG TARGETARCH
+RUN xcaddy build \
+	--with github.com/dunglas/mercure \
+	--with github.com/dunglas/mercure/caddy \
+	--with github.com/dunglas/vulcain \
+	--with github.com/dunglas/vulcain/caddy
+
+# Caddy image
+FROM caddy:${CADDY_VERSION} AS app_caddy
 
 WORKDIR /srv/app
 
-# Download Caddy compiled with the Mercure and Vulcain modules
-ADD --chmod=500 https://caddyserver.com/api/download?os=linux&arch=$TARGETARCH&p=github.com/dunglas/mercure/caddy&p=github.com/dunglas/vulcain/caddy /usr/bin/caddy
-
+COPY --from=app_caddy_builder --link /usr/bin/caddy /usr/bin/caddy
+COPY --from=app_php --link /srv/app/public public/
 COPY --link docker/caddy/Caddyfile /etc/caddy/Caddyfile
-
-# Prod Caddy image
-FROM caddy_base AS caddy_prod
-
-COPY --from=php_prod --link /srv/app/public public/
