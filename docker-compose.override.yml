@@ -34,6 +34,7 @@ services:
 
     ###> symfony/mailer ###
     mailer:
+        container_name: programmierprojekt_mail
         image: schickling/mailcatcher
         ports: ["1025", "1080"]
 ###< symfony/mailer ###
